@@ -82,9 +82,8 @@ your presets come along.
 
 ## Disclaimer
 
-**This project was written by an AI, at my request.** I'm a student; this is the first tool
-I've published. The idea, the requirements and the testing are mine, the code is mostly the
-AI's — please treat it as a learning project rather than mature software.
+**This project was written by an AI, at my request.** Please treat it as a small personal
+tool rather than mature software.
 
 - It's a single Python script (~300 lines, stdlib only). Read it before you run it.
 - It only talks to niri over IPC. It does not touch your `config.kdl`, and it does not
@@ -93,7 +92,7 @@ AI's — please treat it as a learning project rather than mature software.
 - No warranty of any kind — see [LICENSE](LICENSE). Use it at your own risk.
 
 Bug reports, corrections and ideas are very welcome — issues and PRs are open. If something
-is wrong or badly written, saying so is genuinely helpful; I'm here to learn.
+is wrong or badly written, saying so is genuinely helpful.
 
 Chinese version: [README.zh-CN.md](README.zh-CN.md)
 
