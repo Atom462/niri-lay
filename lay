@@ -222,10 +222,35 @@ def cmd_add():
     print(f"✓ 已叠进聚焦列（{SPAWN_CMD}）")
 
 
+def cmd_help():
+    print(f"""lay - 保存/还原 niri 分屏格局 / niri layout presets
+
+用法 / usage:
+  lay save <名字>   把当前焦点工作区的格局存成预设（几列/每列几窗/宽高比例）
+  lay               列出所有预设
+  lay <名字>         还原：自动切到空工作区 → 开终端 → 摆成预设的样子
+  lay add           当前工作区开一个新终端，叠进聚焦的那列
+  lay rm <名字>     删除预设
+  lay -h | --help   显示本帮助
+
+示例 / examples:
+  摆好格局后:            lay save 写代码
+  换到空工作区一键还原:    lay 写代码
+  边用边加一个终端:        lay add
+
+环境变量 / env:
+  LAY_SPAWN=foot       还原/新增时用别的终端（默认 kitty）
+
+预设文件 / presets: {PRESET_FILE}
+依赖 / deps: niri (niri msg IPC) + python3 标准库""")
+
+
 def main():
     args = sys.argv[1:]
     if not args:
         cmd_list()
+    elif args[0] in ("-h", "--help", "help"):
+        cmd_help()
     elif args[0] == "save" and len(args) >= 2:
         cmd_save(args[1])
     elif args[0] == "list":
