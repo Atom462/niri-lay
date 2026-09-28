@@ -4,11 +4,13 @@
 # 用法 / usage:
 #   lay save <名字>   把当前工作区的列格局存成预设
 #   lay               列出所有预设
-#   lay <名字>         在当前(空)工作区还原预设：开终端 + 摆列宽
-#   lay add           在当前工作区开一个终端，叠进聚焦的那列
+#   lay <名字>         还原：自动切到空工作区，从零开终端摆成预设
+#   lay add <名字>     现场补齐：不换工作区，眼前终端当第一格，
+#                      把预设剩下的终端补齐并整层排布
 #   lay rm <名字>     删除预设
+#   lay -h | --help   帮助
 #
-# 依赖: niri (niri msg IPC) + python3 (标准库) / deps: niri IPC + stdlib python3
+# 依赖: niri (niri msg IPC) + python3 (标准库)
 # 预设文件: ~/.config/niri-lay/presets.json（换机时拷走即可 / portable）
 
 import json
@@ -53,48 +55,86 @@ def write_presets(p: dict):
     PRESET_FILE.write_text(json.dumps(p, ensure_ascii=False, indent=2))
 
 
-def output_width(ws) -> int:
-    """工作区所在输出的逻辑宽度（算列宽比例的分母）/ logical width of output"""
-    outputs = niri("outputs", as_json=True)
-    out = outputs.get(ws["output"], {})
+def output_size(ws) -> tuple:
+    """输出逻辑宽高（比例分母）/ logical size of output"""
+    out = niri("outputs", as_json=True).get(ws["output"], {})
     if out.get("logical"):
-        return out["logical"]["width"]
-    modes = out.get("modes") or [{}]
-    return modes[out.get("current_mode", 0)].get("width", 2560)
-
-
-def output_height(ws) -> int:
-    """工作区所在输出的逻辑高度（算窗高比例的分母）/ logical height of output"""
-    outputs = niri("outputs", as_json=True)
-    out = outputs.get(ws["output"], {})
-    if out.get("logical"):
-        return out["logical"]["height"]
-    modes = out.get("modes") or [{}]
-    return modes[out.get("current_mode", 0)].get("height", 1440)
+        return out["logical"]["width"], out["logical"]["height"]
+    m = (out.get("modes") or [{}]).get(out.get("current_mode", 0), {})
+    return m.get("width", 2560), m.get("height", 1440)
 
 
 def focused_workspace():
-    ws_list = niri("workspaces", as_json=True)
-    return next((w for w in ws_list if w["is_focused"]), None)
+    return next((w for w in niri("workspaces", as_json=True) if w["is_focused"]), None)
 
 
-def current_windows():
-    return niri("windows", as_json=True)
+def workspace_windows(ws_id: int) -> list:
+    return [w for w in niri("windows", as_json=True)
+            if w["workspace_id"] == ws_id and not w.get("is_floating")]
+
+
+def get_plan(name: str) -> list:
+    presets = load_presets()
+    if name not in presets:
+        sys.exit(f"没有预设「{name}」，用 lay 查看列表")
+    return presets[name]["columns"]
+
+
+def spawn_and_stack(plan: list):
+    """按 plan 依次开终端；同列叠进，新列另开 / spawn terminals following plan"""
+    act("focus-column-first")
+    first_spawn = True
+    for ci, col in enumerate(plan):
+        for _j in range(col["count"]):
+            if not act("spawn", "--", SPAWN_CMD):
+                sys.exit("spawn 失败，中止")
+            time.sleep(0.7)
+            starts_new_col = (ci == 0 and first_spawn) or (_j == 0)
+            # 每个新窗都合进左邻列，除非它自己开一列 / merge into left unless new column
+            if not first_spawn and not starts_new_col:
+                act("consume-or-expel-window-left")
+                time.sleep(0.15)
+            first_spawn = False
+
+
+def apply_heights(plan: list):
+    """列内每窗高度按比例定点设置（最后一个吃余量）/ set stacked heights by id"""
+    if not any(len(c.get("heights") or []) > 1 for c in plan):
+        return
+    ws = focused_workspace()
+    cols = {}
+    for w in workspace_windows(ws["id"]):
+        lay = w.get("layout") or {}
+        pos = lay.get("pos_in_scrolling_layout") or [0, 0]
+        cols.setdefault(pos[0], []).append((pos[1], w["id"]))
+    for ci, x in enumerate(sorted(cols)):
+        hs = (plan[ci].get("heights") or []) if ci < len(plan) else []
+        ordered = [wid for _, wid in sorted(cols[x])]
+        for j in range(min(len(ordered) - 1, len(hs) - 1)):
+            act("set-window-height", "--id", str(ordered[j]), f"{hs[j] * 100:.2f}%")
+            time.sleep(0.1)
+
+
+def apply_widths(plan: list):
+    """逐列摆宽，收工把焦点还给第一列 / set column widths, park focus on first"""
+    act("focus-column-first")
+    time.sleep(0.3)
+    for i, col in enumerate(plan):
+        act("set-column-width", f"{col['width'] * 100:.2f}%")
+        if i < len(plan) - 1:
+            act("focus-column-right")
+            time.sleep(0.15)
+    act("focus-column-first")
 
 
 def cmd_save(name: str):
     ws = focused_workspace()
     if not ws:
         sys.exit("找不到焦点工作区")
-    out_w = output_width(ws)
-    out_h = output_height(ws)
-    wins = [
-        w for w in current_windows()
-        if w["workspace_id"] == ws["id"] and not w.get("is_floating")
-    ]
+    out_w, out_h = output_size(ws)
+    wins = workspace_windows(ws["id"])
     if not wins:
         sys.exit("当前工作区没有窗口可保存")
-    # 按 pos_in_scrolling_layout[0] 分组 = 分列 / group by column index
     cols = {}
     for w in wins:
         lay = w.get("layout") or {}
@@ -104,7 +144,7 @@ def cmd_save(name: str):
         c["n"] += 1
         c["w"] = max(c["w"], size[0])
         c["apps"].append(w.get("app_id", "?"))
-        c["ys"][pos[1]] = size[1]  # 记列内每窗高度 / remember each window's height
+        c["ys"][pos[1]] = size[1]  # 记列内每窗高度 / remember heights
     presets = load_presets()
     presets[name] = {
         "columns": [
@@ -138,88 +178,66 @@ def cmd_list():
         print(f"  {name:<12} {len(cols)} 列 {total} 窗 · {widths} · {p['saved_at']}")
 
 
-def cmd_restore(name: str):
-    presets = load_presets()
-    if name not in presets:
-        sys.exit(f"没有预设「{name}」，用 lay 查看列表")
-    plan = presets[name]["columns"]
+def ensure_empty_below():
+    """当前工作区有窗则滑到下方新空区 / hop to a fresh empty workspace below"""
     ws = focused_workspace()
     if not ws:
         sys.exit("找不到焦点工作区")
-    existing = [w for w in current_windows()
-                if w["workspace_id"] == ws["id"] and not w.get("is_floating")]
-    if existing:
-        # 当前工作区有窗口（比如正在敲命令的这个）→ 自动滑到下方新空工作区
-        # current workspace busy (e.g. the terminal you typed in) → hop to a fresh one below
-        print("▸ 当前工作区有窗口 → 自动切到下方空工作区…")
-        act("focus-workspace-down")
-        time.sleep(0.5)
-        ws = focused_workspace()
-        if not ws:
-            sys.exit("切换工作区失败")
-        still = [w for w in current_windows()
-                 if w["workspace_id"] == ws["id"] and not w.get("is_floating")]
-        if still:
-            sys.exit("找不到空工作区——手动滑到一个空的再 lay")
+    if not workspace_windows(ws["id"]):
+        return ws
+    print("▸ 当前工作区有窗口 → 自动切到下方空工作区…")
+    act("focus-workspace-down")
+    time.sleep(0.5)
+    ws = focused_workspace()
+    if not ws or workspace_windows(ws["id"]):
+        sys.exit("找不到空工作区——手动滑到一个空的再试")
+    return ws
+
+
+def cmd_restore(name: str):
+    plan = get_plan(name)
+    ensure_empty_below()
     print(f"▸ 还原「{name}」: 开 {sum(c['count'] for c in plan)} 个 {SPAWN_CMD}…")
-    act("focus-column-first")
-    first_done = False
-    for ci, col in enumerate(plan):
-        for j in range(col["count"]):
-            if not act("spawn", "--", SPAWN_CMD):
-                sys.exit("spawn 失败，中止")
-            time.sleep(0.7)
-            if first_done:
-                # 同组内合并进左邻列 / merge into left neighbour within same group
-                if not (ci > 0 and j == 0):
-                    act("consume-or-expel-window-left")
-                    time.sleep(0.15)
-            first_done = True
-    # 列内每窗高度：按保存的比例定点设置（最后一个吃余量）/ set stacked heights by id
-    hs_plan = [c.get("heights") or [] for c in plan]
-    if any(len(h) > 1 for h in hs_plan):
-        ws_now = focused_workspace()
-        spawned = [w for w in current_windows()
-                   if w["workspace_id"] == ws_now["id"] and not w.get("is_floating")]
-        cols = {}
-        for w in spawned:
-            lay = w.get("layout") or {}
-            pos = lay.get("pos_in_scrolling_layout") or [0, 0]
-            cols.setdefault(pos[0], []).append((pos[1], w["id"]))
-        for ci, x in enumerate(sorted(cols)):
-            hs = hs_plan[ci] if ci < len(hs_plan) else []
-            ordered = [wid for _, wid in sorted(cols[x])]
-            # 只设前 k-1 个，最后一个自动吃余量 / set first k-1, last takes the rest
-            for j in range(min(len(ordered) - 1, len(hs) - 1)):
-                act("set-window-height", "--id", str(ordered[j]),
-                    f"{hs[j] * 100:.2f}%")
-                time.sleep(0.1)
-    # 逐列摆宽 / set width column by column
-    act("focus-column-first")
-    time.sleep(0.3)
-    for i, col in enumerate(plan):
-        pct = f"{col['width'] * 100:.2f}%"
-        act("set-column-width", pct)
-        if i < len(plan) - 1:
-            act("focus-column-right")
-            time.sleep(0.15)
-    # 摆完收工：焦点回到第一列（方便直接开打）/ park focus on the first column
-    act("focus-column-first")
+    spawn_and_stack(plan)
+    apply_heights(plan)
+    apply_widths(plan)
     print(f"✓ 「{name}」还原完成——内容自己填 / now type your stuff")
 
 
-def cmd_add():
-    """当前工作区开一个终端，叠进聚焦列 / spawn one terminal stacked into focused column"""
+def cmd_add(name: str):
+    """现场补齐：眼前终端当第一格，补开其余并排布 / fill current workspace to plan"""
+    plan = get_plan(name)
     ws = focused_workspace()
     if not ws:
         sys.exit("找不到焦点工作区")
-    if not act("spawn", "--", SPAWN_CMD):
-        sys.exit("spawn 失败")
-    time.sleep(0.7)
-    # 新窗默认是聚焦列右边的新列 → consume 合并进左邻(聚焦)列
-    # new window opens as its own column → consume merges it into the left neighbour
-    act("consume-or-expel-window-left")
-    print(f"✓ 已叠进聚焦列（{SPAWN_CMD}）")
+    existing = sorted(workspace_windows(ws["id"]),
+                      key=lambda w: ((w.get("layout") or {})
+                                     .get("pos_in_scrolling_layout") or [0, 0]))
+    total = sum(c["count"] for c in plan)
+    if len(existing) > total:
+        sys.exit(f"现有 {len(existing)} 窗 > 预设 {total} 窗——预设装不下，换个预设或重存")
+    if plan and len(existing) > plan[0]["count"]:
+        sys.exit(f"v1 限制：现有窗口需都在第一列（第一列只有 {plan[0]['count']} 格）")
+    print(f"▸ 补齐「{name}」: 现有 {len(existing)} 窗，补开 {total - len(existing)} 个…")
+    if existing:
+        act("focus-column-first")
+    taken = 0  # 已占槽（含现有）/ slots taken so far
+    for ci, col in enumerate(plan):
+        for j in range(col["count"]):
+            if ci == 0 and j < len(existing):
+                taken += 1
+                continue
+            if not act("spawn", "--", SPAWN_CMD):
+                sys.exit("spawn 失败，中止")
+            time.sleep(0.7)
+            starts_new_col = (ci == 0 and taken == 0) or (ci > 0 and j == 0)
+            if taken > 0 and not starts_new_col:
+                act("consume-or-expel-window-left")
+                time.sleep(0.15)
+            taken += 1
+    apply_heights(plan)
+    apply_widths(plan)
+    print(f"✓ 「{name}」补齐完成——你的终端已是格子之一")
 
 
 def cmd_help():
@@ -228,18 +246,19 @@ def cmd_help():
 用法 / usage:
   lay save <名字>   把当前焦点工作区的格局存成预设（几列/每列几窗/宽高比例）
   lay               列出所有预设
-  lay <名字>         还原：自动切到空工作区 → 开终端 → 摆成预设的样子
-  lay add           当前工作区开一个新终端，叠进聚焦的那列
+  lay <名字>         还原：自动切到空工作区，从零开终端摆成预设
+  lay add <名字>     现场补齐：不换工作区，眼前终端当第一格，
+                     补开剩余终端并整层按预设排布
   lay rm <名字>     删除预设
   lay -h | --help   显示本帮助
 
 示例 / examples:
-  摆好格局后:            lay save 写代码
-  换到空工作区一键还原:    lay 写代码
-  边用边加一个终端:        lay add
+  摆好格局后:              lay save 写代码
+  空工作区一键还原:         lay 写代码
+  开一个终端就想铺满:       lay add 写代码
 
 环境变量 / env:
-  LAY_SPAWN=foot       还原/新增时用别的终端（默认 kitty）
+  LAY_SPAWN=foot       用别的终端（默认 kitty）
 
 预设文件 / presets: {PRESET_FILE}
 依赖 / deps: niri (niri msg IPC) + python3 标准库""")
@@ -255,8 +274,8 @@ def main():
         cmd_save(args[1])
     elif args[0] == "list":
         cmd_list()
-    elif args[0] == "add":
-        cmd_add()
+    elif args[0] == "add" and len(args) >= 2:
+        cmd_add(args[1])
     elif args[0] == "rm" and len(args) >= 2:
         presets = load_presets()
         if presets.pop(args[1], None) is None:
@@ -264,6 +283,8 @@ def main():
         write_presets(presets)
         print(f"✓ 已删除「{args[1]}」")
     else:
+        if args[0] == "add":
+            sys.exit("用法: lay add <名字>")
         cmd_restore(args[0])
 
 
