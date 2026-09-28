@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+# lay - 保存/还原 niri 工作区布局预设 / save & restore niri workspace layout presets
+#
+# 用法 / usage:
+#   lay save <名字>   把当前工作区的列格局存成预设
+#   lay               列出所有预设
+#   lay <名字>         在当前(空)工作区还原预设：开终端 + 摆列宽
+#   lay add           在当前工作区开一个终端，叠进聚焦的那列
+#   lay rm <名字>     删除预设
+#
+# 依赖: niri (niri msg IPC) + python3 (标准库) / deps: niri IPC + stdlib python3
+# 预设文件: ~/.config/niri-lay/presets.json（换机时拷走即可 / portable）
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PRESET_FILE = Path.home() / ".config/niri-lay/presets.json"
+SPAWN_CMD = os.environ.get("LAY_SPAWN", "kitty")  # 还原时开什么 / what to spawn
+
+
+def niri(*args, as_json=False):
+    cmd = ["niri", "msg"] + (["-j"] if as_json else []) + list(args)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"niri msg 失败: {r.stderr.strip()}")
+    return json.loads(r.stdout) if as_json else r.stdout.strip()
+
+
+def act(*args):
+    """执行一个 niri action，失败只警告不中断 / run one action, warn on failure"""
+    r = subprocess.run(["niri", "msg", "action", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"  ⚠ action {' '.join(args[:2])}…: {r.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def load_presets() -> dict:
+    if PRESET_FILE.exists():
+        try:
+            return json.loads(PRESET_FILE.read_text())
+        except json.JSONDecodeError:
+            sys.exit(f"预设文件损坏: {PRESET_FILE}")
+    return {}
+
+
+def write_presets(p: dict):
+    PRESET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PRESET_FILE.write_text(json.dumps(p, ensure_ascii=False, indent=2))
+
+
+def output_width(ws) -> int:
+    """工作区所在输出的逻辑宽度（算列宽比例的分母）/ logical width of output"""
+    outputs = niri("outputs", as_json=True)
+    out = outputs.get(ws["output"], {})
+    if out.get("logical"):
+        return out["logical"]["width"]
+    modes = out.get("modes") or [{}]
+    return modes[out.get("current_mode", 0)].get("width", 2560)
+
+
+def output_height(ws) -> int:
+    """工作区所在输出的逻辑高度（算窗高比例的分母）/ logical height of output"""
+    outputs = niri("outputs", as_json=True)
+    out = outputs.get(ws["output"], {})
+    if out.get("logical"):
+        return out["logical"]["height"]
+    modes = out.get("modes") or [{}]
+    return modes[out.get("current_mode", 0)].get("height", 1440)
+
+
+def focused_workspace():
+    ws_list = niri("workspaces", as_json=True)
+    return next((w for w in ws_list if w["is_focused"]), None)
+
+
+def current_windows():
+    return niri("windows", as_json=True)
+
+
+def cmd_save(name: str):
+    ws = focused_workspace()
+    if not ws:
+        sys.exit("找不到焦点工作区")
+    out_w = output_width(ws)
+    out_h = output_height(ws)
+    wins = [
+        w for w in current_windows()
+        if w["workspace_id"] == ws["id"] and not w.get("is_floating")
+    ]
+    if not wins:
+        sys.exit("当前工作区没有窗口可保存")
+    # 按 pos_in_scrolling_layout[0] 分组 = 分列 / group by column index
+    cols = {}
+    for w in wins:
+        lay = w.get("layout") or {}
+        pos = lay.get("pos_in_scrolling_layout") or [0, 0]
+        size = lay.get("tile_size") or [0, 0]
+        c = cols.setdefault(pos[0], {"n": 0, "w": size[0], "apps": [], "ys": {}})
+        c["n"] += 1
+        c["w"] = max(c["w"], size[0])
+        c["apps"].append(w.get("app_id", "?"))
+        c["ys"][pos[1]] = size[1]  # 记列内每窗高度 / remember each window's height
+    presets = load_presets()
+    presets[name] = {
+        "columns": [
+            {"count": cols[x]["n"], "width": round(cols[x]["w"] / out_w, 4),
+             "apps": cols[x]["apps"],
+             "heights": [round(cols[x]["ys"][y] / out_h, 4)
+                         for y in sorted(cols[x]["ys"])]}
+            for x in sorted(cols)
+        ],
+        "saved_at": time.strftime("%Y-%m-%d %H:%M"),
+        "output_width": out_w,
+    }
+    write_presets(presets)
+    print(f"✓ 已保存「{name}」: {len(cols)} 列 / {len(wins)} 窗")
+    for i, c in enumerate(presets[name]["columns"]):
+        hs = " / ".join(f"{h * 100:.0f}%" for h in c.get("heights", []))
+        print(f"    列{i + 1}: {c['count']} 窗 · 宽 {c['width'] * 100:.1f}%"
+              + (f" · 高 {hs}" if hs else ""))
+
+
+def cmd_list():
+    presets = load_presets()
+    if not presets:
+        print("还没有预设。先摆好格局，然后: lay save <名字>")
+        return
+    print(f"预设（{PRESET_FILE}）:")
+    for name, p in presets.items():
+        cols = p["columns"]
+        total = sum(c["count"] for c in cols)
+        widths = " | ".join(f"{c['width'] * 100:.0f}%" for c in cols)
+        print(f"  {name:<12} {len(cols)} 列 {total} 窗 · {widths} · {p['saved_at']}")
+
+
+def cmd_restore(name: str):
+    presets = load_presets()
+    if name not in presets:
+        sys.exit(f"没有预设「{name}」，用 lay 查看列表")
+    plan = presets[name]["columns"]
+    ws = focused_workspace()
+    if not ws:
+        sys.exit("找不到焦点工作区")
+    existing = [w for w in current_windows()
+                if w["workspace_id"] == ws["id"] and not w.get("is_floating")]
+    if existing:
+        # 当前工作区有窗口（比如正在敲命令的这个）→ 自动滑到下方新空工作区
+        # current workspace busy (e.g. the terminal you typed in) → hop to a fresh one below
+        print("▸ 当前工作区有窗口 → 自动切到下方空工作区…")
+        act("focus-workspace-down")
+        time.sleep(0.5)
+        ws = focused_workspace()
+        if not ws:
+            sys.exit("切换工作区失败")
+        still = [w for w in current_windows()
+                 if w["workspace_id"] == ws["id"] and not w.get("is_floating")]
+        if still:
+            sys.exit("找不到空工作区——手动滑到一个空的再 lay")
+    print(f"▸ 还原「{name}」: 开 {sum(c['count'] for c in plan)} 个 {SPAWN_CMD}…")
+    act("focus-column-first")
+    first_done = False
+    for ci, col in enumerate(plan):
+        for j in range(col["count"]):
+            if not act("spawn", "--", SPAWN_CMD):
+                sys.exit("spawn 失败，中止")
+            time.sleep(0.7)
+            if first_done:
+                # 同组内合并进左邻列 / merge into left neighbour within same group
+                if not (ci > 0 and j == 0):
+                    act("consume-or-expel-window-left")
+                    time.sleep(0.15)
+            first_done = True
+    # 列内每窗高度：按保存的比例定点设置（最后一个吃余量）/ set stacked heights by id
+    hs_plan = [c.get("heights") or [] for c in plan]
+    if any(len(h) > 1 for h in hs_plan):
+        ws_now = focused_workspace()
+        spawned = [w for w in current_windows()
+                   if w["workspace_id"] == ws_now["id"] and not w.get("is_floating")]
+        cols = {}
+        for w in spawned:
+            lay = w.get("layout") or {}
+            pos = lay.get("pos_in_scrolling_layout") or [0, 0]
+            cols.setdefault(pos[0], []).append((pos[1], w["id"]))
+        for ci, x in enumerate(sorted(cols)):
+            hs = hs_plan[ci] if ci < len(hs_plan) else []
+            ordered = [wid for _, wid in sorted(cols[x])]
+            # 只设前 k-1 个，最后一个自动吃余量 / set first k-1, last takes the rest
+            for j in range(min(len(ordered) - 1, len(hs) - 1)):
+                act("set-window-height", "--id", str(ordered[j]),
+                    f"{hs[j] * 100:.2f}%")
+                time.sleep(0.1)
+    # 逐列摆宽 / set width column by column
+    act("focus-column-first")
+    time.sleep(0.3)
+    for i, col in enumerate(plan):
+        pct = f"{col['width'] * 100:.2f}%"
+        act("set-column-width", pct)
+        if i < len(plan) - 1:
+            act("focus-column-right")
+            time.sleep(0.15)
+    # 摆完收工：焦点回到第一列（方便直接开打）/ park focus on the first column
+    act("focus-column-first")
+    print(f"✓ 「{name}」还原完成——内容自己填 / now type your stuff")
+
+
+def cmd_add():
+    """当前工作区开一个终端，叠进聚焦列 / spawn one terminal stacked into focused column"""
+    ws = focused_workspace()
+    if not ws:
+        sys.exit("找不到焦点工作区")
+    if not act("spawn", "--", SPAWN_CMD):
+        sys.exit("spawn 失败")
+    time.sleep(0.7)
+    # 新窗默认是聚焦列右边的新列 → consume 合并进左邻(聚焦)列
+    # new window opens as its own column → consume merges it into the left neighbour
+    act("consume-or-expel-window-left")
+    print(f"✓ 已叠进聚焦列（{SPAWN_CMD}）")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        cmd_list()
+    elif args[0] == "save" and len(args) >= 2:
+        cmd_save(args[1])
+    elif args[0] == "list":
+        cmd_list()
+    elif args[0] == "add":
+        cmd_add()
+    elif args[0] == "rm" and len(args) >= 2:
+        presets = load_presets()
+        if presets.pop(args[1], None) is None:
+            sys.exit(f"没有预设「{args[1]}」")
+        write_presets(presets)
+        print(f"✓ 已删除「{args[1]}」")
+    else:
+        cmd_restore(args[0])
+
+
+if __name__ == "__main__":
+    main()
