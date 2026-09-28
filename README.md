@@ -23,8 +23,8 @@ lay rm 学习       # 删除预设
 ## 安装
 
 ```bash
-git clone <this repo>
-ln -s "$PWD/lay" ~/.local/bin/lay     # 或 cp 到 PATH 里
+git clone <this repo> ~/.config/niri/niri-lay   # 与 config.kdl 同级，作 niri 插件
+ln -s ~/.config/niri/niri-lay/lay ~/.local/bin/lay   # 或 cp 到 PATH 里
 ```
 
 ## 预设存哪
