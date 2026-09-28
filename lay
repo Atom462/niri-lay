@@ -219,6 +219,8 @@ def cmd_add(name: str):
     if plan and len(existing) > plan[0]["count"]:
         sys.exit(f"v1 限制：现有窗口需都在第一列（第一列只有 {plan[0]['count']} 格）")
     print(f"▸ 补齐「{name}」: 现有 {len(existing)} 窗，补开 {total - len(existing)} 个…")
+    # 记下你敲命令的这个终端（现有窗里最左上那个）/ remember the terminal you typed in
+    anchor_id = existing[0]["id"] if existing else None
     if existing:
         act("focus-column-first")
     taken = 0  # 已占槽（含现有）/ slots taken so far
@@ -237,6 +239,10 @@ def cmd_add(name: str):
             taken += 1
     apply_heights(plan)
     apply_widths(plan)
+    # 焦点精确回到敲命令的终端 / park focus exactly on the command terminal
+    if anchor_id is not None:
+        time.sleep(0.2)
+        act("focus-window", "--id", str(anchor_id))
     print(f"✓ 「{name}」补齐完成——你的终端已是格子之一")
 
 
