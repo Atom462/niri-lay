@@ -1,92 +1,102 @@
 # niri-lay
 
-**保存 niri 当前的分屏格局，一键还原。**（save & restore niri workspace layout presets）
+Save and restore niri workspace layouts as named presets.
 
-Windows 有固定的分屏布局，niri 只有自动平铺——`lay` 补上"把手动摆好的格局存成预设、随时拉回来"这一块：
+I run niri (with DMS) on Arch Linux. Every time I sat down to work I arranged the same few
+terminals by hand again — same columns, same widths, same stacking. I got tired of
+re-planning the layout every session, so I had an AI write this small script: it saves a
+layout I set up once, and puts it back later.
 
-```bash
-lay save 学习     # 把当前工作区（几列、每列几窗、各列多宽）存成预设
-lay               # 列出所有预设
-lay 学习          # 一键：自动切到空工作区 → 开终端 → 摆成预设的样子
-lay add 学习       # 现场补齐：眼前终端当第一格，补开剩余终端并整层排布
-lay switch 学习 写代码  # 当前像 A 就切 B，像 B 就切 A（原地来回跳）
-lay edit 学习      # 用 $EDITOR 直接改预设（给名字跳到那行）
-lay rm 学习       # 删除预设
-```
-
-还原后只开终端、不执行命令——内容自己输入。
-
----
-
-## 常用场景
-
-**存一个固定工位**：手摆好窗口 → `lay save 写代码`。以后任何时候 `lay 写代码` 就还原。
-
-**在已有工作区铺开**：你正在某个终端里，敲 `lay add 写代码`——**你敲命令的这个终端会成为第一格**，收工时焦点精确回到你手上这个终端。
-
-**两个格局来回跳**：`lay switch 学习 写代码`。它比对当前工作区与两份预设的结构（每列窗数 + 宽度），像 A 就切到 B，像 B 就切到 A；两份都不像时会报错，不会乱动你的窗口。
-
-**还原成原来的程序**：加 `--apps`，按存档里的程序清单开（终端以外的程序也开），某个程序不在 PATH 就回退成终端并提示。
-
----
-
-## 标志
+That's the whole idea. It is **not** a session manager — it doesn't snapshot your desktop
+or reopen your apps. It only stores and rebuilds the *shape*.
 
 ```bash
-lay --json        # 输出 presets.json 原文，方便脚本处理
-lay --apps 学习    # 还原时开存档里的程序，不只开终端
+lay save study     # store the current workspace layout as "study"
+lay                # list presets
+lay study          # hop to an empty workspace and rebuild "study"
+lay add study      # fill the current workspace — the terminal you typed in becomes cell 1
+lay switch study code   # if the layout looks like "study" switch to "code", and vice versa
+lay edit study     # edit the preset JSON in $EDITOR
+lay rm study       # delete a preset
 ```
 
----
+Restoring only opens terminals; it runs nothing inside them. You type your own content.
 
-## 依赖
+## Requirements
 
-- [niri](https://github.com/niri-wm/niri)（用到 `niri msg` IPC 与 action：`spawn` / `consume-or-expel-window-left` / `set-column-width` / `focus-window`）
-- Python ≥ 3.10（仅标准库）
-- 一个终端（默认 `kitty`，用 `LAY_SPAWN=foot lay <名字>` 换）
-- `lay edit` 需要 `$EDITOR`（默认 `nvim`）
+- [niri](https://github.com/niri-wm/niri) — uses `niri msg` IPC and these actions:
+  `spawn`, `consume-or-expel-window-left`, `set-column-width`, `focus-column`, `focus-window`
+- Python ≥ 3.10 (standard library only, no dependencies)
+- a terminal to spawn (default `kitty`; override with `LAY_SPAWN=foot lay study`)
+- `$EDITOR` for `lay edit` (default `nvim`)
 
----
+Tested on Arch Linux with niri 26.04 and kitty. It should work on any niri build exposing
+the actions above.
 
-## 安装
+## Install
 
 ```bash
-git clone <this repo> ~/.config/niri/niri-lay   # 与 config.kdl 同级，作 niri 插件
-ln -s ~/.config/niri/niri-lay/lay ~/.local/bin/lay   # 或 cp 到 PATH 里
+git clone <this repo> ~/.config/niri/niri-lay     # lives next to config.kdl, as a niri plugin
+ln -s ~/.config/niri/niri-lay/lay ~/.local/bin/lay
 ```
 
----
+## How it behaves
 
-## 预设存哪
+- **`save <name>`** — reads every window's column position and tile size in the focused
+  workspace; stores the column widths as ratios *and* as absolute pixels, plus per-column
+  stacking heights and the `app_id` of each cell.
+- **`<name>`** — hops to an empty workspace below (niri creates one), spawns terminals,
+  merges them into columns, then sets widths. If the current output width equals the saved
+  one, widths are applied in pixels (exact); otherwise it falls back to percentages so it
+  still works on another monitor.
+- **`add <name>`** — never leaves the current workspace: existing windows fill the first
+  column, missing terminals are spawned, and focus is put back on the terminal you ran the
+  command in.
+- **`switch A B`** — compares the current layout against A and B (column count + widths).
+  Looks like A → you get B; looks like B → you get A; looks like neither → it refuses and
+  touches nothing.
+- **`--apps`** — at restore time, open the recorded `app_id` for each cell instead of a
+  terminal (falls back to the terminal when the binary isn't in `PATH`).
+- **`--json`** — print `presets.json` as-is, for scripting.
 
-`~/.config/niri-lay/presets.json` —— 换机器拷这一个文件即可带走全部预设。
+Presets live in `~/.config/niri-lay/presets.json`. One file — copy it to a new machine and
+your presets come along.
 
-| 字段 | 用途 |
-|---|---|
-| `count` / `width` | 每列窗数、占输出宽度的比例 |
-| `width_px` | 保存时的绝对像素宽——**同一显示器还原时用它，更精准**；换了分辨率才回退到比例 |
-| `heights` | 列内每窗的高度比例 |
-| `apps` | 每格跑的程序，`--apps` 用 |
+| field | meaning |
+| --- | --- |
+| `count`, `width` | windows in the column, width as a ratio of the output |
+| `width_px` | absolute width at save time — used when the output width matches |
+| `heights` | per-window height ratios inside a stacked column |
+| `apps` | program in each cell, used by `--apps` |
 
----
+## Limitations
 
-## 原理
+- Only terminals are spawned; the script doesn't remember *what* ran inside each cell
+  (`--apps` just opens the recorded program list once).
+- Floating windows and multi-monitor setups are not handled.
+- No tabbed/grouped columns, no window rules.
+- Restoring spawns several terminals — it hops to an empty workspace first, so it won't
+  shove your current work aside. `add` and `switch` work in place and refuse when the
+  layout doesn't fit.
+- `switch` needs the current layout to match one of the two presets; there's no fuzzy match.
 
-1. **保存**：`niri msg -j windows` 读每个窗口的列位置（`pos_in_scrolling_layout`）与列宽，除以输出逻辑宽度存成比例，同时留一份绝对像素。
-2. **还原**：在空工作区 `spawn` 终端 → 同组窗口用 `consume-or-expel-window-left` 合并进同一列 → 逐列 `set-column-width` 摆宽（输出宽度与保存时一致就用像素，否则用比例）。
-3. **切换**：比对当前工作区与两份预设的结构，确定目标后走补齐流程。
+## Disclaimer
 
----
+**This project was written by an AI, at my request.** I'm a student; this is the first tool
+I've published. The idea, the requirements and the testing are mine, the code is mostly the
+AI's — please treat it as a learning project rather than mature software.
 
-## 已知边界（v1）
+- It's a single Python script (~300 lines, stdlib only). Read it before you run it.
+- It only talks to niri over IPC. It does not touch your `config.kdl`, and it does not
+  delete files.
+- Tested only on my setup (Arch Linux, niri 26.04, kitty). Rough edges are likely.
+- No warranty of any kind — see [LICENSE](LICENSE). Use it at your own risk.
 
-- 当前工作区有窗口时**自动滑到下方新空工作区**再还原（找不到空的才报错）
-- 还原对象是"格子"，不记忆每个格子里跑的是什么（`--apps` 只在还原时按清单开一次）
-- `switch` 需要当前格局与两份预设之一吻合，否则报错不动手
-- 多显示器、浮动窗口暂不支持
+Bug reports, corrections and ideas are very welcome — issues and PRs are open. If something
+is wrong or badly written, saying so is genuinely helpful; I'm here to learn.
 
----
+Chinese version: [README.zh-CN.md](README.zh-CN.md)
 
 ## License
 
-MIT
+[MIT](LICENSE)
