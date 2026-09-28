@@ -7,6 +7,8 @@
 #   lay <名字>         还原：自动切到空工作区，从零开终端摆成预设
 #   lay add <名字>     现场补齐：不换工作区，眼前终端当第一格，
 #                      把预设剩下的终端补齐并整层排布
+#   lay switch <A> <B> 当前格局像 A 就原地切成 B，像 B 就切成 A
+#   lay edit [名字]    用 $EDITOR 改预设 JSON（给名字跳到那行）
 #   lay rm <名字>     删除预设
 #   lay -h | --help   帮助
 #
@@ -15,6 +17,8 @@
 
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -73,28 +77,63 @@ def workspace_windows(ws_id: int) -> list:
             if w["workspace_id"] == ws_id and not w.get("is_floating")]
 
 
-def get_plan(name: str) -> list:
+def column_structures(ws_id: int) -> list:
+    """当前工作区列结构（save/switch 共用）/ column snapshot of a workspace"""
+    wins = workspace_windows(ws_id)
+    if not wins:
+        return []
+    ws = next(w for w in niri("workspaces", as_json=True) if w["id"] == ws_id)
+    out_w, out_h = output_size(ws)
+    cols = {}
+    for w in wins:
+        lay = w.get("layout") or {}
+        pos = lay.get("pos_in_scrolling_layout") or [0, 0]
+        size = lay.get("tile_size") or [0, 0]
+        c = cols.setdefault(pos[0], {"n": 0, "w": size[0], "apps": {}, "ys": {}})
+        c["n"] += 1
+        c["w"] = max(c["w"], size[0])
+        c["apps"][pos[1]] = w.get("app_id", "?")
+        c["ys"][pos[1]] = size[1]
+    return [{"count": cols[x]["n"],
+             "width": round(cols[x]["w"] / out_w, 4),
+             "width_px": cols[x]["w"],
+             "apps": [cols[x]["apps"][y] for y in sorted(cols[x]["apps"])],
+             "heights": [round(cols[x]["ys"][y] / out_h, 4)
+                         for y in sorted(cols[x]["ys"])]}
+            for x in sorted(cols)]
+
+
+def get_preset(name: str) -> dict:
     presets = load_presets()
     if name not in presets:
         sys.exit(f"没有预设「{name}」，用 lay 查看列表")
-    return presets[name]["columns"]
+    return presets[name]
 
 
-def spawn_and_stack(plan: list):
+def spawn_and_stack(plan: list, use_apps: bool = False):
     """按 plan 依次开终端；同列叠进，新列另开 / spawn terminals following plan"""
     act("focus-column-first")
     first_spawn = True
+    fallback = 0
     for ci, col in enumerate(plan):
+        apps = col.get("apps") or []
         for _j in range(col["count"]):
-            if not act("spawn", "--", SPAWN_CMD):
+            cmd = SPAWN_CMD
+            if use_apps and _j < len(apps) and apps[_j] and shutil.which(apps[_j]):
+                cmd = apps[_j]
+            elif use_apps:
+                fallback += 1
+            if not act("spawn", "--", cmd):
                 sys.exit("spawn 失败，中止")
-            time.sleep(0.7)
+            time.sleep(0.7 if cmd == SPAWN_CMD else 1.0)
             starts_new_col = (ci == 0 and first_spawn) or (_j == 0)
             # 每个新窗都合进左邻列，除非它自己开一列 / merge into left unless new column
             if not first_spawn and not starts_new_col:
                 act("consume-or-expel-window-left")
                 time.sleep(0.15)
             first_spawn = False
+    if fallback:
+        print(f"  ⚠ {fallback} 个格子回退到 {SPAWN_CMD}（预设里的程序不在 PATH）")
 
 
 def apply_heights(plan: list):
@@ -115,12 +154,21 @@ def apply_heights(plan: list):
             time.sleep(0.1)
 
 
-def apply_widths(plan: list):
-    """逐列摆宽，收工把焦点还给第一列 / set column widths, park focus on first"""
+def apply_widths(plan: list, preset: dict = None):
+    """逐列摆宽；同逻辑宽度的输出用绝对像素更准 / exact px when output matches"""
     act("focus-column-first")
     time.sleep(0.3)
+    use_px = False
+    if preset and preset.get("output_width"):
+        ws = focused_workspace()
+        if ws and output_size(ws)[0] == preset["output_width"]:
+            use_px = True
     for i, col in enumerate(plan):
-        act("set-column-width", f"{col['width'] * 100:.2f}%")
+        if use_px and col.get("width_px"):
+            arg = str(int(round(col["width_px"])))
+        else:
+            arg = f"{col['width'] * 100:.2f}%"
+        act("set-column-width", arg)
         if i < len(plan) - 1:
             act("focus-column-right")
             time.sleep(0.15)
@@ -132,41 +180,29 @@ def cmd_save(name: str):
     if not ws:
         sys.exit("找不到焦点工作区")
     out_w, out_h = output_size(ws)
-    wins = workspace_windows(ws["id"])
-    if not wins:
+    cols_data = column_structures(ws["id"])
+    if not cols_data:
         sys.exit("当前工作区没有窗口可保存")
-    cols = {}
-    for w in wins:
-        lay = w.get("layout") or {}
-        pos = lay.get("pos_in_scrolling_layout") or [0, 0]
-        size = lay.get("tile_size") or [0, 0]
-        c = cols.setdefault(pos[0], {"n": 0, "w": size[0], "apps": [], "ys": {}})
-        c["n"] += 1
-        c["w"] = max(c["w"], size[0])
-        c["apps"].append(w.get("app_id", "?"))
-        c["ys"][pos[1]] = size[1]  # 记列内每窗高度 / remember heights
     presets = load_presets()
     presets[name] = {
-        "columns": [
-            {"count": cols[x]["n"], "width": round(cols[x]["w"] / out_w, 4),
-             "apps": cols[x]["apps"],
-             "heights": [round(cols[x]["ys"][y] / out_h, 4)
-                         for y in sorted(cols[x]["ys"])]}
-            for x in sorted(cols)
-        ],
+        "columns": cols_data,
         "saved_at": time.strftime("%Y-%m-%d %H:%M"),
         "output_width": out_w,
     }
     write_presets(presets)
-    print(f"✓ 已保存「{name}」: {len(cols)} 列 / {len(wins)} 窗")
+    print(f"✓ 已保存「{name}」: {len(cols_data)} 列 / "
+          f"{sum(c['count'] for c in cols_data)} 窗")
     for i, c in enumerate(presets[name]["columns"]):
         hs = " / ".join(f"{h * 100:.0f}%" for h in c.get("heights", []))
         print(f"    列{i + 1}: {c['count']} 窗 · 宽 {c['width'] * 100:.1f}%"
               + (f" · 高 {hs}" if hs else ""))
 
 
-def cmd_list():
+def cmd_list(as_json: bool = False):
     presets = load_presets()
+    if as_json:
+        print(json.dumps(presets, ensure_ascii=False, indent=2))
+        return
     if not presets:
         print("还没有预设。先摆好格局，然后: lay save <名字>")
         return
@@ -175,7 +211,9 @@ def cmd_list():
         cols = p["columns"]
         total = sum(c["count"] for c in cols)
         widths = " | ".join(f"{c['width'] * 100:.0f}%" for c in cols)
-        print(f"  {name:<12} {len(cols)} 列 {total} 窗 · {widths} · {p['saved_at']}")
+        star = "★" if any(c.get("apps") for c in cols) else " "
+        print(f"  \x1b[36m{name}\x1b[0m {star} {len(cols)} 列 {total} 窗"
+              f" · \x1b[2m{widths} · {p['saved_at']}\x1b[0m")
 
 
 def ensure_empty_below():
@@ -194,19 +232,22 @@ def ensure_empty_below():
     return ws
 
 
-def cmd_restore(name: str):
-    plan = get_plan(name)
+def cmd_restore(name: str, use_apps: bool = False):
+    preset = get_preset(name)
+    plan = preset["columns"]
     ensure_empty_below()
-    print(f"▸ 还原「{name}」: 开 {sum(c['count'] for c in plan)} 个 {SPAWN_CMD}…")
-    spawn_and_stack(plan)
+    print(f"▸ 还原「{name}」: 开 {sum(c['count'] for c in plan)} 个"
+          f" {'程序' if use_apps else SPAWN_CMD}…")
+    spawn_and_stack(plan, use_apps)
     apply_heights(plan)
-    apply_widths(plan)
+    apply_widths(plan, preset)
     print(f"✓ 「{name}」还原完成——内容自己填 / now type your stuff")
 
 
 def cmd_add(name: str):
     """现场补齐：眼前终端当第一格，补开其余并排布 / fill current workspace to plan"""
-    plan = get_plan(name)
+    preset = get_preset(name)
+    plan = preset["columns"]
     ws = focused_workspace()
     if not ws:
         sys.exit("找不到焦点工作区")
@@ -238,7 +279,7 @@ def cmd_add(name: str):
                 time.sleep(0.15)
             taken += 1
     apply_heights(plan)
-    apply_widths(plan)
+    apply_widths(plan, preset)
     # 焦点精确回到敲命令的终端 / park focus exactly on the command terminal
     if anchor_id is not None:
         time.sleep(0.2)
@@ -246,42 +287,103 @@ def cmd_add(name: str):
     print(f"✓ 「{name}」补齐完成——你的终端已是格子之一")
 
 
+def struct_sig(cols: list) -> tuple:
+    """只看结构：每列几窗、多宽（比对用）/ structure-only signature"""
+    return tuple((c["count"], round(c["width"], 2)) for c in cols)
+
+
+def cmd_switch(a: str, b: str):
+    """当前像 A 就切 B，像 B 就切 A / flip between two presets in place"""
+    ws = focused_workspace()
+    if not ws:
+        sys.exit("找不到焦点工作区")
+    cur = column_structures(ws["id"])
+    if not cur:
+        sys.exit("当前工作区没有窗口——直接 lay <名字> 还原就行")
+    sig = struct_sig(cur)
+    pa, pb = get_preset(a), get_preset(b)
+    if sig == struct_sig(pa["columns"]):
+        target = b
+    elif sig == struct_sig(pb["columns"]):
+        target = a
+    else:
+        sys.exit(f"当前格局既不像「{a}」也不像「{b}」——先 lay save 存一份再切")
+    print(f"▸ 当前 ≈ 「{a if target == b else b}」→ 切到「{target}」")
+    cmd_add(target)
+
+
+def cmd_edit(name: str = None):
+    """用 $EDITOR 改预设 JSON（给名字跳到那行）/ edit presets in your editor"""
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "nvim"
+    argv = shlex.split(editor)
+    line = 1
+    if name:
+        if not PRESET_FILE.exists() or name not in load_presets():
+            sys.exit(f"没有预设「{name}」，用 lay 查看列表")
+        for i, ln in enumerate(PRESET_FILE.read_text().splitlines(), 1):
+            if f'"{name}"' in ln:
+                line = i
+                break
+        argv += [f"+{line}"]
+    argv += [str(PRESET_FILE)]
+    subprocess.call(argv)
+    # 改完验一下 JSON，坏了直接说 / validate JSON after editing
+    try:
+        json.loads(PRESET_FILE.read_text())
+    except json.JSONDecodeError:
+        sys.exit(f"⚠ JSON 语法错了，lay 会读不了——{PRESET_FILE}")
+
+
 def cmd_help():
     print(f"""lay - 保存/还原 niri 分屏格局 / niri layout presets
 
 用法 / usage:
   lay save <名字>   把当前焦点工作区的格局存成预设（几列/每列几窗/宽高比例）
-  lay               列出所有预设
+  lay               列出所有预设（--json 输出原始数据）
   lay <名字>         还原：自动切到空工作区，从零开终端摆成预设
-  lay add <名字>     现场补齐：不换工作区，眼前终端当第一格，
-                     补开剩余终端并整层按预设排布
+  lay add <名字>     现场补齐：眼前终端当第一格，补开剩余并排布
+  lay switch <A> <B> 当前像 A 就切 B，像 B 就切 A（原地来回跳）
+  lay edit [名字]    用 $EDITOR 改预设（给名字直接跳到那行）
   lay rm <名字>     删除预设
   lay -h | --help   显示本帮助
+
+标志 / flags:
+  --apps   还原/补齐时开预设里存的程序，不是全开终端
+  --json   仅配合无参数 lay，输出 presets.json 原文
 
 示例 / examples:
   摆好格局后:              lay save 写代码
   空工作区一键还原:         lay 写代码
   开一个终端就想铺满:       lay add 写代码
+  两个格局来回跳:          lay switch 写代码 看论文
+  还原成原来的程序:         lay --apps 写代码
 
 环境变量 / env:
   LAY_SPAWN=foot       用别的终端（默认 kitty）
+  EDITOR=nvim          lay edit 用哪个编辑器
 
 预设文件 / presets: {PRESET_FILE}
 依赖 / deps: niri (niri msg IPC) + python3 标准库""")
 
 
 def main():
-    args = sys.argv[1:]
+    use_apps = "--apps" in sys.argv
+    as_json = "--json" in sys.argv
+    args = [a for a in sys.argv[1:] if a not in ("--apps", "--json")]
     if not args:
-        cmd_list()
+        cmd_list(as_json)
     elif args[0] in ("-h", "--help", "help"):
         cmd_help()
     elif args[0] == "save" and len(args) >= 2:
         cmd_save(args[1])
     elif args[0] == "list":
-        cmd_list()
+        cmd_list(as_json)
     elif args[0] == "add" and len(args) >= 2:
         cmd_add(args[1])
+    elif args[0] == "switch" and len(args) >= 3:
+        cmd_switch(args[1], args[2])
+    elif args[0] == "edit":
+        cmd_edit(args[1] if len(args) >= 2 else None)
     elif args[0] == "rm" and len(args) >= 2:
         presets = load_presets()
         if presets.pop(args[1], None) is None:
@@ -289,9 +391,7 @@ def main():
         write_presets(presets)
         print(f"✓ 已删除「{args[1]}」")
     else:
-        if args[0] == "add":
-            sys.exit("用法: lay add <名字>")
-        cmd_restore(args[0])
+        cmd_restore(args[0], use_apps)
 
 
 if __name__ == "__main__":
